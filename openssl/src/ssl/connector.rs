@@ -5,7 +5,7 @@ use error::ErrorStack;
 use ssl::{self, SslMethod, SslContextBuilder, SslContext, Ssl, SSL_VERIFY_PEER, SslStream,
           HandshakeError};
 use pkey::PKeyRef;
-use x509::X509Ref;
+use x509::{X509, X509Ref};
 
 // ffdhe2048 from https://wiki.mozilla.org/Security/Server_Side_TLS#ffdhe2048
 const DHPARAM_PEM: &'static str = "
@@ -51,6 +51,27 @@ impl SslConnectorBuilder {
     pub fn new(method: SslMethod) -> Result<SslConnectorBuilder, ErrorStack> {
         let mut ctx = try!(ctx(method));
         try!(ctx.set_default_verify_paths());
+
+        #[cfg(target_os = "android")]
+        {
+            use std::fs;
+            use std::io::Read;
+            
+            let cert_store = ctx.cert_store_mut();
+
+            if let Ok(certs) = fs::read_dir("/system/etc/security/cacerts") {
+                for entry in certs.filter_map(|r| r.ok()).filter(|e| e.path().is_file()) {
+                    let mut cert = String::new();
+                    if let Ok(_) = fs::File::open(entry.path())
+                            .and_then(|mut f| f.read_to_string(&mut cert)) {
+                        if let Ok(cert) = X509::from_pem(cert.as_bytes()) {
+                            try!(cert_store.add_cert(cert));
+                        }
+                    }
+                }
+            }
+        }
+
         // From https://github.com/python/cpython/blob/c30098c8c6014f3340a369a31df9c74bdbacc269/Lib/ssl.py#L191
         try!(ctx.set_cipher_list("ECDH+AESGCM:ECDH+CHACHA20:DH+AESGCM:DH+CHACHA20:ECDH+AES256:\
                                   DH+AES256:ECDH+AES128:DH+AES:ECDH+HIGH:DH+HIGH:RSA+AESGCM:\
