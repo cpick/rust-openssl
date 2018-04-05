@@ -5,7 +5,9 @@ use error::ErrorStack;
 use ssl::{self, SslMethod, SslContextBuilder, SslContext, Ssl, SSL_VERIFY_PEER, SslStream,
           HandshakeError};
 use pkey::PKeyRef;
-use x509::{X509, X509Ref};
+#[cfg(target_os = "android")]
+use x509::X509;
+use x509::X509Ref;
 
 // ffdhe2048 from https://wiki.mozilla.org/Security/Server_Side_TLS#ffdhe2048
 const DHPARAM_PEM: &'static str = "
