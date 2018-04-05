@@ -1,13 +1,20 @@
 use std::io::{Read, Write};
+use std::ops::{Deref, DerefMut};
 
 use dh::Dh;
 use error::ErrorStack;
-use ssl::{self, SslMethod, SslContextBuilder, SslContext, Ssl, SSL_VERIFY_PEER, SslStream,
-          HandshakeError};
+use ssl::{self, HandshakeError, Ssl, SslRef, SslContext, SslContextBuilder, SslMethod, SslStream,
+          SSL_VERIFY_PEER};
 use pkey::PKeyRef;
+use version;
 #[cfg(target_os = "android")]
 use x509::X509;
 use x509::X509Ref;
+
+#[cfg(ossl101)]
+lazy_static! {
+    static ref HOSTNAME_IDX: ::ex_data::Index<Ssl, String> = Ssl::new_ex_index().unwrap();
+}
 
 // ffdhe2048 from https://wiki.mozilla.org/Security/Server_Side_TLS#ffdhe2048
 const DHPARAM_PEM: &'static str = "
@@ -22,7 +29,7 @@ ssbzSibBsu/6iGtCOGEoXJf//////////wIBAg==
 ";
 
 fn ctx(method: SslMethod) -> Result<SslContextBuilder, ErrorStack> {
-    let mut ctx = try!(SslContextBuilder::new(method));
+    let mut ctx = SslContextBuilder::new(method)?;
 
     let mut opts = ssl::SSL_OP_ALL;
     opts &= !ssl::SSL_OP_NETSCAPE_REUSE_CIPHER_CHANGE_BUG;
@@ -36,8 +43,16 @@ fn ctx(method: SslMethod) -> Result<SslContextBuilder, ErrorStack> {
     opts |= ssl::SSL_OP_CIPHER_SERVER_PREFERENCE;
     ctx.set_options(opts);
 
-    let mode = ssl::SSL_MODE_AUTO_RETRY | ssl::SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
-               ssl::SSL_MODE_ENABLE_PARTIAL_WRITE;
+    let mut mode = ssl::SSL_MODE_AUTO_RETRY | ssl::SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER
+        | ssl::SSL_MODE_ENABLE_PARTIAL_WRITE;
+
+    // This is quite a useful optimization for saving memory, but historically
+    // caused CVEs in OpenSSL pre-1.0.1h, according to
+    // https://bugs.python.org/issue25672
+    if version::number() >= 0x1000108f {
+        mode |= ssl::SSL_MODE_RELEASE_BUFFERS;
+    }
+
     ctx.set_mode(mode);
 
     Ok(ctx)
@@ -51,14 +66,14 @@ impl SslConnectorBuilder {
     ///
     /// The default configuration is subject to change, and is currently derived from Python.
     pub fn new(method: SslMethod) -> Result<SslConnectorBuilder, ErrorStack> {
-        let mut ctx = try!(ctx(method));
-        try!(ctx.set_default_verify_paths());
+        let mut ctx = ctx(method)?;
+        ctx.set_default_verify_paths()?;
 
         #[cfg(target_os = "android")]
         {
             use std::fs;
             use std::io::Read;
-            
+
             let cert_store = ctx.cert_store_mut();
 
             if let Ok(certs) = fs::read_dir("/system/etc/security/cacerts") {
@@ -74,28 +89,48 @@ impl SslConnectorBuilder {
             }
         }
 
-        // From https://github.com/python/cpython/blob/c30098c8c6014f3340a369a31df9c74bdbacc269/Lib/ssl.py#L191
-        try!(ctx.set_cipher_list("ECDH+AESGCM:ECDH+CHACHA20:DH+AESGCM:DH+CHACHA20:ECDH+AES256:\
-                                  DH+AES256:ECDH+AES128:DH+AES:ECDH+HIGH:DH+HIGH:RSA+AESGCM:\
-                                  RSA+AES:RSA+HIGH:!aNULL:!eNULL:!MD5:!3DES"));
-        ctx.set_verify(SSL_VERIFY_PEER);
+        // From https://github.com/python/cpython/blob/a170fa162dc03f0a014373349e548954fff2e567/Lib/ssl.py#L193
+        ctx.set_cipher_list(
+            "TLS13-AES-256-GCM-SHA384:TLS13-CHACHA20-POLY1305-SHA256:\
+             TLS13-AES-128-GCM-SHA256:\
+             ECDH+AESGCM:ECDH+CHACHA20:DH+AESGCM:DH+CHACHA20:ECDH+AES256:DH+AES256:\
+             ECDH+AES128:DH+AES:ECDH+HIGH:DH+HIGH:RSA+AESGCM:RSA+AES:RSA+HIGH:\
+             !aNULL:!eNULL:!MD5:!3DES",
+        )?;
+        setup_verify(&mut ctx);
 
         Ok(SslConnectorBuilder(ctx))
     }
 
-    /// Returns a shared reference to the inner `SslContextBuilder`.
+    #[deprecated(since = "0.9.23",
+                 note = "SslConnectorBuilder now implements Deref<Target=SslContextBuilder>")]
     pub fn builder(&self) -> &SslContextBuilder {
-        &self.0
+        self
     }
 
-    /// Returns a mutable reference to the inner `SslContextBuilder`.
+    #[deprecated(since = "0.9.23",
+                 note = "SslConnectorBuilder now implements DerefMut<Target=SslContextBuilder>")]
     pub fn builder_mut(&mut self) -> &mut SslContextBuilder {
-        &mut self.0
+        self
     }
 
-    /// Consumes the builder, returning a `SslConnector`.
+    /// Consumes the builder, returning an `SslConnector`.
     pub fn build(self) -> SslConnector {
         SslConnector(self.0.build())
+    }
+}
+
+impl Deref for SslConnectorBuilder {
+    type Target = SslContextBuilder;
+
+    fn deref(&self) -> &SslContextBuilder {
+        &self.0
+    }
+}
+
+impl DerefMut for SslConnectorBuilder {
+    fn deref_mut(&mut self) -> &mut SslContextBuilder {
+        &mut self.0
     }
 }
 
@@ -114,25 +149,29 @@ impl SslConnector {
     ///
     /// The domain is used for SNI and hostname verification.
     pub fn connect<S>(&self, domain: &str, stream: S) -> Result<SslStream<S>, HandshakeError<S>>
-        where S: Read + Write
+    where
+        S: Read + Write,
     {
-        try!(self.configure()).connect(domain, stream)
+        self.configure()?.connect(domain, stream)
     }
 
     /// Initiates a client-side TLS session on a stream without performing hostname verification.
-    ///
-    /// The verification configuration of the connector's `SslContext` is not overridden.
     ///
     /// # Warning
     ///
     /// You should think very carefully before you use this method. If hostname verification is not
     /// used, *any* valid certificate for *any* site will be trusted for use from any other. This
     /// introduces a significant vulnerability to man-in-the-middle attacks.
-    pub fn danger_connect_without_providing_domain_for_certificate_verification_and_server_name_indication<S>(
-            &self, stream: S) -> Result<SslStream<S>, HandshakeError<S>>
-        where S: Read + Write
+    pub fn danger_connect_without_providing_domain_for_certificate_verification_and_server_name_indication<
+        S,
+    >(
+        &self,
+        stream: S,
+    ) -> Result<SslStream<S>, HandshakeError<S>>
+    where
+        S: Read + Write,
     {
-        try!(self.configure())
+        self.configure()?
             .danger_connect_without_providing_domain_for_certificate_verification_and_server_name_indication(stream)
     }
 
@@ -146,12 +185,14 @@ impl SslConnector {
 pub struct ConnectConfiguration(Ssl);
 
 impl ConnectConfiguration {
-    /// Returns a shared reference to the inner `Ssl`.
+    #[deprecated(since = "0.9.23",
+                 note = "ConnectConfiguration now implements Deref<Target=SslRef>")]
     pub fn ssl(&self) -> &Ssl {
         &self.0
     }
 
-    /// Returns a mutable reference to the inner `Ssl`.
+    #[deprecated(since = "0.9.23",
+                 note = "ConnectConfiguration now implements DerefMut<Target=SslRef>")]
     pub fn ssl_mut(&mut self) -> &mut Ssl {
         &mut self.0
     }
@@ -160,10 +201,11 @@ impl ConnectConfiguration {
     ///
     /// The domain is used for SNI and hostname verification.
     pub fn connect<S>(mut self, domain: &str, stream: S) -> Result<SslStream<S>, HandshakeError<S>>
-        where S: Read + Write
+    where
+        S: Read + Write,
     {
-        try!(self.0.set_hostname(domain));
-        try!(setup_verify(&mut self.0, domain));
+        self.0.set_hostname(domain)?;
+        setup_verify_hostname(&mut self.0, domain)?;
 
         self.0.connect(stream)
     }
@@ -177,11 +219,30 @@ impl ConnectConfiguration {
     /// You should think very carefully before you use this method. If hostname verification is not
     /// used, *any* valid certificate for *any* site will be trusted for use from any other. This
     /// introduces a significant vulnerability to man-in-the-middle attacks.
-    pub fn danger_connect_without_providing_domain_for_certificate_verification_and_server_name_indication<S>(
-            self, stream: S) -> Result<SslStream<S>, HandshakeError<S>>
-        where S: Read + Write
+    pub fn danger_connect_without_providing_domain_for_certificate_verification_and_server_name_indication<
+        S,
+    >(
+        self,
+        stream: S,
+    ) -> Result<SslStream<S>, HandshakeError<S>>
+    where
+        S: Read + Write,
     {
         self.0.connect(stream)
+    }
+}
+
+impl Deref for ConnectConfiguration {
+    type Target = SslRef;
+
+    fn deref(&self) -> &SslRef {
+        &self.0
+    }
+}
+
+impl DerefMut for ConnectConfiguration {
+    fn deref_mut(&mut self) -> &mut SslRef {
+        &mut self.0
     }
 }
 
@@ -196,15 +257,17 @@ impl SslAcceptorBuilder {
     /// recommendations. See its [documentation][docs] for more details on specifics.
     ///
     /// [docs]: https://wiki.mozilla.org/Security/Server_Side_TLS
-    pub fn mozilla_intermediate<I>(method: SslMethod,
-                                   private_key: &PKeyRef,
-                                   certificate: &X509Ref,
-                                   chain: I)
-                                   -> Result<SslAcceptorBuilder, ErrorStack>
-        where I: IntoIterator,
-              I::Item: AsRef<X509Ref>
+    pub fn mozilla_intermediate<I>(
+        method: SslMethod,
+        private_key: &PKeyRef,
+        certificate: &X509Ref,
+        chain: I,
+    ) -> Result<SslAcceptorBuilder, ErrorStack>
+    where
+        I: IntoIterator,
+        I::Item: AsRef<X509Ref>,
     {
-        let builder = try!(SslAcceptorBuilder::mozilla_intermediate_raw(method));
+        let builder = SslAcceptorBuilder::mozilla_intermediate_raw(method)?;
         builder.finish_setup(private_key, certificate, chain)
     }
 
@@ -214,78 +277,83 @@ impl SslAcceptorBuilder {
     /// See its [documentation][docs] for more details on specifics.
     ///
     /// [docs]: https://wiki.mozilla.org/Security/Server_Side_TLS
-    pub fn mozilla_modern<I>(method: SslMethod,
-                             private_key: &PKeyRef,
-                             certificate: &X509Ref,
-                             chain: I)
-                             -> Result<SslAcceptorBuilder, ErrorStack>
-        where I: IntoIterator,
-              I::Item: AsRef<X509Ref>
+    pub fn mozilla_modern<I>(
+        method: SslMethod,
+        private_key: &PKeyRef,
+        certificate: &X509Ref,
+        chain: I,
+    ) -> Result<SslAcceptorBuilder, ErrorStack>
+    where
+        I: IntoIterator,
+        I::Item: AsRef<X509Ref>,
     {
-        let builder = try!(SslAcceptorBuilder::mozilla_modern_raw(method));
+        let builder = SslAcceptorBuilder::mozilla_modern_raw(method)?;
         builder.finish_setup(private_key, certificate, chain)
     }
 
     /// Like `mozilla_intermediate`, but does not load the certificate chain and private key.
     pub fn mozilla_intermediate_raw(method: SslMethod) -> Result<SslAcceptorBuilder, ErrorStack> {
-        let mut ctx = try!(ctx(method));
-        let dh = try!(Dh::from_pem(DHPARAM_PEM.as_bytes()));
-        try!(ctx.set_tmp_dh(&dh));
-        try!(setup_curves(&mut ctx));
-        try!(ctx.set_cipher_list("ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
-                                  ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
-                                  ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:\
-                                  DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:\
-                                  ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:\
-                                  ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:\
-                                  ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA384:\
-                                  ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:\
-                                  DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:\
-                                  DHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA:\
-                                  ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:\
-                                  EDH-RSA-DES-CBC3-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:\
-                                  AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA:\
-                                  DES-CBC3-SHA:!DSS"));
+        let mut ctx = ctx(method)?;
+        let dh = Dh::from_pem(DHPARAM_PEM.as_bytes())?;
+        ctx.set_tmp_dh(&dh)?;
+        setup_curves(&mut ctx)?;
+        ctx.set_cipher_list(
+            "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
+             ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
+             ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:\
+             DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-SHA256:\
+             ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:\
+             ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA:\
+             ECDHE-RSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA256:\
+             DHE-RSA-AES256-SHA:ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:\
+             EDH-RSA-DES-CBC3-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:AES256-SHA256:\
+             AES128-SHA:AES256-SHA:DES-CBC3-SHA:!DSS",
+        )?;
         Ok(SslAcceptorBuilder(ctx))
     }
 
     /// Like `mozilla_modern`, but does not load the certificate chain and private key.
     pub fn mozilla_modern_raw(method: SslMethod) -> Result<SslAcceptorBuilder, ErrorStack> {
-        let mut ctx = try!(ctx(method));
-        try!(setup_curves(&mut ctx));
-        try!(ctx.set_cipher_list("ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:\
-                                  ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
-                                  ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
-                                  ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:\
-                                  ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256"));
+        let mut ctx = ctx(method)?;
+        setup_curves(&mut ctx)?;
+        ctx.set_cipher_list(
+            "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:\
+             ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
+             ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-SHA384:\
+             ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256",
+        )?;
         Ok(SslAcceptorBuilder(ctx))
     }
 
-    fn finish_setup<I>(mut self,
-                       private_key: &PKeyRef,
-                       certificate: &X509Ref,
-                       chain: I)
-                       -> Result<SslAcceptorBuilder, ErrorStack>
-        where I: IntoIterator,
-              I::Item: AsRef<X509Ref>
+    fn finish_setup<I>(
+        mut self,
+        private_key: &PKeyRef,
+        certificate: &X509Ref,
+        chain: I,
+    ) -> Result<SslAcceptorBuilder, ErrorStack>
+    where
+        I: IntoIterator,
+        I::Item: AsRef<X509Ref>,
     {
-        try!(self.0.set_private_key(private_key));
-        try!(self.0.set_certificate(certificate));
-        try!(self.0.check_private_key());
+        self.0.set_private_key(private_key)?;
+        self.0.set_certificate(certificate)?;
+        self.0.check_private_key()?;
         for cert in chain {
-            try!(self.0.add_extra_chain_cert(cert.as_ref().to_owned()));
+            self.0.add_extra_chain_cert(cert.as_ref().to_owned())?;
         }
         Ok(self)
     }
 
-    /// Returns a shared reference to the inner `SslContextBuilder`.
+    #[deprecated(since = "0.9.23",
+                 note = "SslAcceptorBuilder now implements Deref<Target=SslContextBuilder>")]
     pub fn builder(&self) -> &SslContextBuilder {
-        &self.0
+        self
     }
 
-    /// Returns a mutable reference to the inner `SslContextBuilder`.
+    #[deprecated(since = "0.9.23",
+                 note = "SslAcceptorBuilder now implements DerefMut<Target=SslContextBuilder>")]
     pub fn builder_mut(&mut self) -> &mut SslContextBuilder {
-        &mut self.0
+        self
     }
 
     /// Consumes the builder, returning a `SslAcceptor`.
@@ -294,12 +362,26 @@ impl SslAcceptorBuilder {
     }
 }
 
+impl Deref for SslAcceptorBuilder {
+    type Target = SslContextBuilder;
+
+    fn deref(&self) -> &SslContextBuilder {
+        &self.0
+    }
+}
+
+impl DerefMut for SslAcceptorBuilder {
+    fn deref_mut(&mut self) -> &mut SslContextBuilder {
+        &mut self.0
+    }
+}
+
 #[cfg(ossl101)]
 fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
     use ec::EcKey;
     use nid;
 
-    let curve = try!(EcKey::from_curve_name(nid::X9_62_PRIME256V1));
+    let curve = EcKey::from_curve_name(nid::X9_62_PRIME256V1)?;
     ctx.set_tmp_ecdh(&curve)
 }
 
@@ -323,28 +405,47 @@ pub struct SslAcceptor(SslContext);
 impl SslAcceptor {
     /// Initiates a server-side TLS session on a stream.
     pub fn accept<S>(&self, stream: S) -> Result<SslStream<S>, HandshakeError<S>>
-        where S: Read + Write
+    where
+        S: Read + Write,
     {
-        let ssl = try!(Ssl::new(&self.0));
+        let ssl = Ssl::new(&self.0)?;
         ssl.accept(stream)
     }
 }
 
 #[cfg(any(ossl102, ossl110))]
-fn setup_verify(ssl: &mut Ssl, domain: &str) -> Result<(), ErrorStack> {
-    // pass a noop closure in here to ensure that we consistently override any callback on the
-    // context
-    ssl.set_verify_callback(SSL_VERIFY_PEER, |p, _| p);
-    let param = ssl._param_mut();
-    param.set_hostflags(::verify::X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-    param.set_host(domain)
+fn setup_verify(ctx: &mut SslContextBuilder) {
+    ctx.set_verify(SSL_VERIFY_PEER);
 }
 
 #[cfg(ossl101)]
-fn setup_verify(ssl: &mut Ssl, domain: &str) -> Result<(), ErrorStack> {
-    let domain = domain.to_owned();
-    ssl.set_verify_callback(SSL_VERIFY_PEER,
-                            move |p, x| verify::verify_callback(&domain, p, x));
+fn setup_verify(ctx: &mut SslContextBuilder) {
+    ctx.set_verify_callback(SSL_VERIFY_PEER, |p, x509| {
+        let hostname = match x509.ssl() {
+            Ok(Some(ssl)) => ssl.ex_data(*HOSTNAME_IDX),
+            _ => None,
+        };
+        match hostname {
+            Some(hostname) => verify::verify_callback(hostname, p, x509),
+            None => p,
+        }
+    });
+}
+
+#[cfg(any(ossl102, ossl110))]
+fn setup_verify_hostname(ssl: &mut Ssl, domain: &str) -> Result<(), ErrorStack> {
+    let param = ssl._param_mut();
+    param.set_hostflags(::verify::X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    match domain.parse() {
+        Ok(ip) => param.set_ip(ip),
+        Err(_) => param.set_host(domain),
+    }
+}
+
+#[cfg(ossl101)]
+fn setup_verify_hostname(ssl: &mut Ssl, domain: &str) -> Result<(), ErrorStack> {
+    let domain = domain.to_string();
+    ssl.set_ex_data(*HOSTNAME_IDX, domain);
     Ok(())
 }
 
@@ -354,13 +455,14 @@ mod verify {
     use std::str;
 
     use nid;
-    use x509::{X509StoreContextRef, X509Ref, X509NameRef, GeneralName};
+    use x509::{GeneralName, X509NameRef, X509Ref, X509StoreContextRef};
     use stack::Stack;
 
-    pub fn verify_callback(domain: &str,
-                           preverify_ok: bool,
-                           x509_ctx: &X509StoreContextRef)
-                           -> bool {
+    pub fn verify_callback(
+        domain: &str,
+        preverify_ok: bool,
+        x509_ctx: &X509StoreContextRef,
+    ) -> bool {
         if !preverify_ok || x509_ctx.error_depth() != 0 {
             return preverify_ok;
         }
@@ -502,14 +604,16 @@ mod verify {
         match (expected, actual.len()) {
             (&IpAddr::V4(ref addr), 4) => actual == addr.octets(),
             (&IpAddr::V6(ref addr), 16) => {
-                let segments = [((actual[0] as u16) << 8) | actual[1] as u16,
-                                ((actual[2] as u16) << 8) | actual[3] as u16,
-                                ((actual[4] as u16) << 8) | actual[5] as u16,
-                                ((actual[6] as u16) << 8) | actual[7] as u16,
-                                ((actual[8] as u16) << 8) | actual[9] as u16,
-                                ((actual[10] as u16) << 8) | actual[11] as u16,
-                                ((actual[12] as u16) << 8) | actual[13] as u16,
-                                ((actual[14] as u16) << 8) | actual[15] as u16];
+                let segments = [
+                    ((actual[0] as u16) << 8) | actual[1] as u16,
+                    ((actual[2] as u16) << 8) | actual[3] as u16,
+                    ((actual[4] as u16) << 8) | actual[5] as u16,
+                    ((actual[6] as u16) << 8) | actual[7] as u16,
+                    ((actual[8] as u16) << 8) | actual[9] as u16,
+                    ((actual[10] as u16) << 8) | actual[11] as u16,
+                    ((actual[12] as u16) << 8) | actual[13] as u16,
+                    ((actual[14] as u16) << 8) | actual[15] as u16,
+                ];
                 segments == addr.segments()
             }
             _ => false,

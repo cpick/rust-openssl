@@ -1,3 +1,27 @@
+//! High level interface to certain symmetric ciphers.
+//!
+//! # Examples
+//!
+//! Encrypt data in AES128 CBC mode
+//!
+//! ```
+//! use openssl::symm::{encrypt, Cipher};
+//!
+//! let cipher = Cipher::aes_128_cbc();
+//! let data = b"Some Crypto Text";
+//! let key = b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F";
+//! let iv = b"\x00\x01\x02\x03\x04\x05\x06\x07\x00\x01\x02\x03\x04\x05\x06\x07";
+//! let ciphertext = encrypt(
+//!     cipher,
+//!     key,
+//!     Some(iv),
+//!     data).unwrap();
+//!
+//! assert_eq!(
+//!     b"\xB4\xB9\xE7\x30\xD6\xD6\xF7\xDE\x77\x3F\x1C\xFF\xB3\x3E\x44\x5A\x91\xD7\x27\x62\x87\x4D\
+//!       \xFB\x3C\x5E\xC4\x59\x72\x4A\xF4\x7C\xA1",
+//!     &ciphertext[..]);
+//! ```
 use std::cmp;
 use std::ptr;
 use libc::c_int;
@@ -12,6 +36,11 @@ pub enum Mode {
     Decrypt,
 }
 
+/// Represents a particular cipher algorithm.
+///
+/// See OpenSSL doc at [`EVP_EncryptInit`] for more information on each algorithms.
+///
+/// [`EVP_EncryptInit`]: https://www.openssl.org/docs/man1.1.0/crypto/EVP_EncryptInit.html
 #[derive(Copy, Clone)]
 pub struct Cipher(*const ffi::EVP_CIPHER);
 
@@ -153,26 +182,88 @@ impl Cipher {
 }
 
 /// Represents a symmetric cipher context.
+///
+/// Padding is enabled by default.
+///
+/// # Examples
+///
+/// Encrypt some plaintext in chunks, then decrypt the ciphertext back into plaintext, in AES 128
+/// CBC mode.
+///
+/// ```
+/// use openssl::symm::{Cipher, Mode, Crypter};
+///
+/// let plaintexts: [&[u8]; 2] = [b"Some Stream of", b" Crypto Text"];
+/// let key = b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F";
+/// let iv = b"\x00\x01\x02\x03\x04\x05\x06\x07\x00\x01\x02\x03\x04\x05\x06\x07";
+/// let data_len = plaintexts.iter().fold(0, |sum, x| sum + x.len());
+///
+/// // Create a cipher context for encryption.
+/// let mut encrypter = Crypter::new(
+///     Cipher::aes_128_cbc(),
+///     Mode::Encrypt,
+///     key,
+///     Some(iv)).unwrap();
+///
+/// let block_size = Cipher::aes_128_cbc().block_size();
+/// let mut ciphertext = vec![0; data_len + block_size];
+///
+/// // Encrypt 2 chunks of plaintexts successively.
+/// let mut count = encrypter.update(plaintexts[0], &mut ciphertext).unwrap();
+/// count += encrypter.update(plaintexts[1], &mut ciphertext[count..]).unwrap();
+/// count += encrypter.finalize(&mut ciphertext[count..]).unwrap();
+/// ciphertext.truncate(count);
+///
+/// assert_eq!(
+///     b"\x0F\x21\x83\x7E\xB2\x88\x04\xAF\xD9\xCC\xE2\x03\x49\xB4\x88\xF6\xC4\x61\x0E\x32\x1C\xF9\
+///       \x0D\x66\xB1\xE6\x2C\x77\x76\x18\x8D\x99",
+///     &ciphertext[..]
+/// );
+///
+///
+/// // Let's pretend we don't know the plaintext, and now decrypt the ciphertext.
+/// let data_len = ciphertext.len();
+/// let ciphertexts = [&ciphertext[..9], &ciphertext[9..]];
+///
+/// // Create a cipher context for decryption.
+/// let mut decrypter = Crypter::new(
+///     Cipher::aes_128_cbc(),
+///     Mode::Decrypt,
+///     key,
+///     Some(iv)).unwrap();
+/// let mut plaintext = vec![0; data_len + block_size];
+///
+/// // Decrypt 2 chunks of ciphertexts successively.
+/// let mut count = decrypter.update(ciphertexts[0], &mut plaintext).unwrap();
+/// count += decrypter.update(ciphertexts[1], &mut plaintext[count..]).unwrap();
+/// count += decrypter.finalize(&mut plaintext[count..]).unwrap();
+/// plaintext.truncate(count);
+///
+/// assert_eq!(b"Some Stream of Crypto Text", &plaintext[..]);
+/// ```
 pub struct Crypter {
     ctx: *mut ffi::EVP_CIPHER_CTX,
     block_size: usize,
 }
 
 impl Crypter {
-    /// Creates a new `Crypter`.
+    /// Creates a new `Crypter`.  The initialisation vector, `iv`, is not necesarry for certain
+    /// types of `Cipher`.
     ///
     /// # Panics
     ///
-    /// Panics if an IV is required by the cipher but not provided.
-    pub fn new(t: Cipher,
-               mode: Mode,
-               key: &[u8],
-               iv: Option<&[u8]>)
-               -> Result<Crypter, ErrorStack> {
+    /// Panics if an IV is required by the cipher but not provided.  Also make sure that the key
+    /// and IV size are appropriate for your cipher.
+    pub fn new(
+        t: Cipher,
+        mode: Mode,
+        key: &[u8],
+        iv: Option<&[u8]>,
+    ) -> Result<Crypter, ErrorStack> {
         ffi::init();
 
         unsafe {
-            let ctx = try!(cvt_p(ffi::EVP_CIPHER_CTX_new()));
+            let ctx = cvt_p(ffi::EVP_CIPHER_CTX_new())?;
             let crypter = Crypter {
                 ctx: ctx,
                 block_size: t.block_size(),
@@ -183,37 +274,46 @@ impl Crypter {
                 Mode::Decrypt => 0,
             };
 
-            try!(cvt(ffi::EVP_CipherInit_ex(crypter.ctx,
-                                             t.as_ptr(),
-                                             ptr::null_mut(),
-                                             ptr::null_mut(),
-                                             ptr::null_mut(),
-                                             mode)));
+            cvt(ffi::EVP_CipherInit_ex(
+                crypter.ctx,
+                t.as_ptr(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                mode,
+            ))?;
 
             assert!(key.len() <= c_int::max_value() as usize);
-            try!(cvt(ffi::EVP_CIPHER_CTX_set_key_length(crypter.ctx, key.len() as c_int)));
+            cvt(ffi::EVP_CIPHER_CTX_set_key_length(
+                crypter.ctx,
+                key.len() as c_int,
+            ))?;
 
             let key = key.as_ptr() as *mut _;
             let iv = match (iv, t.iv_len()) {
                 (Some(iv), Some(len)) => {
                     if iv.len() != len {
                         assert!(iv.len() <= c_int::max_value() as usize);
-                        try!(cvt(ffi::EVP_CIPHER_CTX_ctrl(crypter.ctx,
-                                                          ffi::EVP_CTRL_GCM_SET_IVLEN,
-                                                          iv.len() as c_int,
-                                                          ptr::null_mut())));
+                        cvt(ffi::EVP_CIPHER_CTX_ctrl(
+                            crypter.ctx,
+                            ffi::EVP_CTRL_GCM_SET_IVLEN,
+                            iv.len() as c_int,
+                            ptr::null_mut(),
+                        ))?;
                     }
                     iv.as_ptr() as *mut _
                 }
                 (Some(_), None) | (None, None) => ptr::null_mut(),
                 (None, Some(_)) => panic!("an IV is required for this cipher"),
             };
-            try!(cvt(ffi::EVP_CipherInit_ex(crypter.ctx,
-                                            ptr::null(),
-                                            ptr::null_mut(),
-                                            key,
-                                            iv,
-                                            mode)));
+            cvt(ffi::EVP_CipherInit_ex(
+                crypter.ctx,
+                ptr::null(),
+                ptr::null_mut(),
+                key,
+                iv,
+                mode,
+            ))?;
 
             Ok(crypter)
         }
@@ -236,11 +336,12 @@ impl Crypter {
         unsafe {
             assert!(tag.len() <= c_int::max_value() as usize);
             // NB: this constant is actually more general than just GCM.
-            cvt(ffi::EVP_CIPHER_CTX_ctrl(self.ctx,
-                                         ffi::EVP_CTRL_GCM_SET_TAG,
-                                         tag.len() as c_int,
-                                         tag.as_ptr() as *mut _))
-                .map(|_| ())
+            cvt(ffi::EVP_CIPHER_CTX_ctrl(
+                self.ctx,
+                ffi::EVP_CTRL_GCM_SET_TAG,
+                tag.len() as c_int,
+                tag.as_ptr() as *mut _,
+            )).map(|_| ())
         }
     }
 
@@ -253,12 +354,13 @@ impl Crypter {
         unsafe {
             assert!(input.len() <= c_int::max_value() as usize);
             let mut len = 0;
-            cvt(ffi::EVP_CipherUpdate(self.ctx,
-                                      ptr::null_mut(),
-                                      &mut len,
-                                      input.as_ptr(),
-                                      input.len() as c_int))
-                .map(|_| ())
+            cvt(ffi::EVP_CipherUpdate(
+                self.ctx,
+                ptr::null_mut(),
+                &mut len,
+                input.as_ptr(),
+                input.len() as c_int,
+            )).map(|_| ())
         }
     }
 
@@ -280,11 +382,13 @@ impl Crypter {
             let mut outl = output.len() as c_int;
             let inl = input.len() as c_int;
 
-            try!(cvt(ffi::EVP_CipherUpdate(self.ctx,
-                                           output.as_mut_ptr(),
-                                           &mut outl,
-                                           input.as_ptr(),
-                                           inl)));
+            cvt(ffi::EVP_CipherUpdate(
+                self.ctx,
+                output.as_mut_ptr(),
+                &mut outl,
+                input.as_ptr(),
+                inl,
+            ))?;
 
             Ok(outl as usize)
         }
@@ -305,7 +409,11 @@ impl Crypter {
             assert!(output.len() >= self.block_size);
             let mut outl = cmp::min(output.len(), c_int::max_value() as usize) as c_int;
 
-            try!(cvt(ffi::EVP_CipherFinal(self.ctx, output.as_mut_ptr(), &mut outl)));
+            cvt(ffi::EVP_CipherFinal(
+                self.ctx,
+                output.as_mut_ptr(),
+                &mut outl,
+            ))?;
 
             Ok(outl as usize)
         }
@@ -322,11 +430,12 @@ impl Crypter {
     pub fn get_tag(&self, tag: &mut [u8]) -> Result<(), ErrorStack> {
         unsafe {
             assert!(tag.len() <= c_int::max_value() as usize);
-            cvt(ffi::EVP_CIPHER_CTX_ctrl(self.ctx,
-                                         ffi::EVP_CTRL_GCM_GET_TAG,
-                                         tag.len() as c_int,
-                                         tag.as_mut_ptr() as *mut _))
-                .map(|_| ())
+            cvt(ffi::EVP_CIPHER_CTX_ctrl(
+                self.ctx,
+                ffi::EVP_CTRL_GCM_GET_TAG,
+                tag.len() as c_int,
+                tag.as_mut_ptr() as *mut _,
+            )).map(|_| ())
         }
     }
 }
@@ -339,40 +448,95 @@ impl Drop for Crypter {
     }
 }
 
-/**
- * Encrypts data, using the specified crypter type in encrypt mode with the
- * specified key and iv; returns the resulting (encrypted) data.
- */
-pub fn encrypt(t: Cipher,
-               key: &[u8],
-               iv: Option<&[u8]>,
-               data: &[u8])
-               -> Result<Vec<u8>, ErrorStack> {
+/// Encrypts data in one go, and returns the encrypted data.
+///
+/// Data is encrypted using the specified cipher type `t` in encrypt mode with the specified `key`
+/// and initailization vector `iv`.
+///
+/// This is a convenient interface to `Crypter` to encrypt all data in one go.  To encrypt a stream
+/// of data increamentally , use `Crypter` instead.
+///
+/// # Examples
+///
+/// Encrypt data in AES128 CBC mode
+///
+/// ```
+/// use openssl::symm::{encrypt, Cipher};
+///
+/// let cipher = Cipher::aes_128_cbc();
+/// let data = b"Some Crypto Text";
+/// let key = b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F";
+/// let iv = b"\x00\x01\x02\x03\x04\x05\x06\x07\x00\x01\x02\x03\x04\x05\x06\x07";
+/// let ciphertext = encrypt(
+///     cipher,
+///     key,
+///     Some(iv),
+///     data).unwrap();
+///
+/// assert_eq!(
+///     b"\xB4\xB9\xE7\x30\xD6\xD6\xF7\xDE\x77\x3F\x1C\xFF\xB3\x3E\x44\x5A\x91\xD7\x27\x62\x87\x4D\
+///       \xFB\x3C\x5E\xC4\x59\x72\x4A\xF4\x7C\xA1",
+///     &ciphertext[..]);
+/// ```
+pub fn encrypt(
+    t: Cipher,
+    key: &[u8],
+    iv: Option<&[u8]>,
+    data: &[u8],
+) -> Result<Vec<u8>, ErrorStack> {
     cipher(t, Mode::Encrypt, key, iv, data)
 }
 
-/**
- * Decrypts data, using the specified crypter type in decrypt mode with the
- * specified key and iv; returns the resulting (decrypted) data.
- */
-pub fn decrypt(t: Cipher,
-               key: &[u8],
-               iv: Option<&[u8]>,
-               data: &[u8])
-               -> Result<Vec<u8>, ErrorStack> {
+/// Decrypts data in one go, and returns the decrypted data.
+///
+/// Data is decrypted using the specified cipher type `t` in decrypt mode with the specified `key`
+/// and initailization vector `iv`.
+///
+/// This is a convenient interface to `Crypter` to decrypt all data in one go.  To decrypt a  stream
+/// of data increamentally , use `Crypter` instead.
+///
+/// # Examples
+///
+/// Decrypt data in AES256 ECB mode
+///
+/// ```
+/// use openssl::symm::{decrypt, Cipher};
+///
+/// let cipher = Cipher::aes_128_cbc();
+/// let data = b"\xB4\xB9\xE7\x30\xD6\xD6\xF7\xDE\x77\x3F\x1C\xFF\xB3\x3E\x44\x5A\x91\xD7\x27\x62\
+///              \x87\x4D\xFB\x3C\x5E\xC4\x59\x72\x4A\xF4\x7C\xA1";
+/// let key = b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F";
+/// let iv = b"\x00\x01\x02\x03\x04\x05\x06\x07\x00\x01\x02\x03\x04\x05\x06\x07";
+/// let ciphertext = decrypt(
+///     cipher,
+///     key,
+///     Some(iv),
+///     data).unwrap();
+///
+/// assert_eq!(
+///     b"Some Crypto Text",
+///     &ciphertext[..]);
+/// ```
+pub fn decrypt(
+    t: Cipher,
+    key: &[u8],
+    iv: Option<&[u8]>,
+    data: &[u8],
+) -> Result<Vec<u8>, ErrorStack> {
     cipher(t, Mode::Decrypt, key, iv, data)
 }
 
-fn cipher(t: Cipher,
-          mode: Mode,
-          key: &[u8],
-          iv: Option<&[u8]>,
-          data: &[u8])
-          -> Result<Vec<u8>, ErrorStack> {
-    let mut c = try!(Crypter::new(t, mode, key, iv));
+fn cipher(
+    t: Cipher,
+    mode: Mode,
+    key: &[u8],
+    iv: Option<&[u8]>,
+    data: &[u8],
+) -> Result<Vec<u8>, ErrorStack> {
+    let mut c = Crypter::new(t, mode, key, iv)?;
     let mut out = vec![0; data.len() + t.block_size()];
-    let count = try!(c.update(data, &mut out));
-    let rest = try!(c.finalize(&mut out[count..]));
+    let count = c.update(data, &mut out)?;
+    let rest = c.finalize(&mut out[count..])?;
     out.truncate(count + rest);
     Ok(out)
 }
@@ -385,19 +549,20 @@ fn cipher(t: Cipher,
 /// The size of the `tag` buffer indicates the required size of the tag. While some ciphers support
 /// a range of tag sizes, it is recommended to pick the maximum size. For AES GCM, this is 16 bytes,
 /// for example.
-pub fn encrypt_aead(t: Cipher,
-                    key: &[u8],
-                    iv: Option<&[u8]>,
-                    aad: &[u8],
-                    data: &[u8],
-                    tag: &mut [u8])
-                    -> Result<Vec<u8>, ErrorStack> {
-    let mut c = try!(Crypter::new(t, Mode::Encrypt, key, iv));
+pub fn encrypt_aead(
+    t: Cipher,
+    key: &[u8],
+    iv: Option<&[u8]>,
+    aad: &[u8],
+    data: &[u8],
+    tag: &mut [u8],
+) -> Result<Vec<u8>, ErrorStack> {
+    let mut c = Crypter::new(t, Mode::Encrypt, key, iv)?;
     let mut out = vec![0; data.len() + t.block_size()];
-    try!(c.aad_update(aad));
-    let count = try!(c.update(data, &mut out));
-    let rest = try!(c.finalize(&mut out[count..]));
-    try!(c.get_tag(tag));
+    c.aad_update(aad)?;
+    let count = c.update(data, &mut out)?;
+    let rest = c.finalize(&mut out[count..])?;
+    c.get_tag(tag)?;
     out.truncate(count + rest);
     Ok(out)
 }
@@ -406,19 +571,20 @@ pub fn encrypt_aead(t: Cipher,
 ///
 /// Additional Authenticated Data can be provided in the `aad` field, and the authentication tag
 /// should be provided in the `tag` field.
-pub fn decrypt_aead(t: Cipher,
-                    key: &[u8],
-                    iv: Option<&[u8]>,
-                    aad: &[u8],
-                    data: &[u8],
-                    tag: &[u8])
-                    -> Result<Vec<u8>, ErrorStack> {
-    let mut c = try!(Crypter::new(t, Mode::Decrypt, key, iv));
+pub fn decrypt_aead(
+    t: Cipher,
+    key: &[u8],
+    iv: Option<&[u8]>,
+    aad: &[u8],
+    data: &[u8],
+    tag: &[u8],
+) -> Result<Vec<u8>, ErrorStack> {
+    let mut c = Crypter::new(t, Mode::Decrypt, key, iv)?;
     let mut out = vec![0; data.len() + t.block_size()];
-    try!(c.aad_update(aad));
-    let count = try!(c.update(data, &mut out));
-    try!(c.set_tag(tag));
-    let rest = try!(c.finalize(&mut out[count..]));
+    c.aad_update(aad)?;
+    let count = c.update(data, &mut out)?;
+    c.set_tag(tag)?;
+    let rest = c.finalize(&mut out[count..])?;
     out.truncate(count + rest);
     Ok(out)
 }
@@ -456,19 +622,82 @@ mod tests {
     // http://csrc.nist.gov/publications/fips/fips197/fips-197.pdf
     #[test]
     fn test_aes_256_ecb() {
-        let k0 = [0x00u8, 0x01u8, 0x02u8, 0x03u8, 0x04u8, 0x05u8, 0x06u8, 0x07u8, 0x08u8, 0x09u8,
-                  0x0au8, 0x0bu8, 0x0cu8, 0x0du8, 0x0eu8, 0x0fu8, 0x10u8, 0x11u8, 0x12u8, 0x13u8,
-                  0x14u8, 0x15u8, 0x16u8, 0x17u8, 0x18u8, 0x19u8, 0x1au8, 0x1bu8, 0x1cu8, 0x1du8,
-                  0x1eu8, 0x1fu8];
-        let p0 = [0x00u8, 0x11u8, 0x22u8, 0x33u8, 0x44u8, 0x55u8, 0x66u8, 0x77u8, 0x88u8, 0x99u8,
-                  0xaau8, 0xbbu8, 0xccu8, 0xddu8, 0xeeu8, 0xffu8];
-        let c0 = [0x8eu8, 0xa2u8, 0xb7u8, 0xcau8, 0x51u8, 0x67u8, 0x45u8, 0xbfu8, 0xeau8, 0xfcu8,
-                  0x49u8, 0x90u8, 0x4bu8, 0x49u8, 0x60u8, 0x89u8];
-        let mut c = super::Crypter::new(super::Cipher::aes_256_ecb(),
-                                        super::Mode::Encrypt,
-                                        &k0,
-                                        None)
-            .unwrap();
+        let k0 = [
+            0x00u8,
+            0x01u8,
+            0x02u8,
+            0x03u8,
+            0x04u8,
+            0x05u8,
+            0x06u8,
+            0x07u8,
+            0x08u8,
+            0x09u8,
+            0x0au8,
+            0x0bu8,
+            0x0cu8,
+            0x0du8,
+            0x0eu8,
+            0x0fu8,
+            0x10u8,
+            0x11u8,
+            0x12u8,
+            0x13u8,
+            0x14u8,
+            0x15u8,
+            0x16u8,
+            0x17u8,
+            0x18u8,
+            0x19u8,
+            0x1au8,
+            0x1bu8,
+            0x1cu8,
+            0x1du8,
+            0x1eu8,
+            0x1fu8,
+        ];
+        let p0 = [
+            0x00u8,
+            0x11u8,
+            0x22u8,
+            0x33u8,
+            0x44u8,
+            0x55u8,
+            0x66u8,
+            0x77u8,
+            0x88u8,
+            0x99u8,
+            0xaau8,
+            0xbbu8,
+            0xccu8,
+            0xddu8,
+            0xeeu8,
+            0xffu8,
+        ];
+        let c0 = [
+            0x8eu8,
+            0xa2u8,
+            0xb7u8,
+            0xcau8,
+            0x51u8,
+            0x67u8,
+            0x45u8,
+            0xbfu8,
+            0xeau8,
+            0xfcu8,
+            0x49u8,
+            0x90u8,
+            0x4bu8,
+            0x49u8,
+            0x60u8,
+            0x89u8,
+        ];
+        let mut c = super::Crypter::new(
+            super::Cipher::aes_256_ecb(),
+            super::Mode::Encrypt,
+            &k0,
+            None,
+        ).unwrap();
         c.pad(false);
         let mut r0 = vec![0; c0.len() + super::Cipher::aes_256_ecb().block_size()];
         let count = c.update(&p0, &mut r0).unwrap();
@@ -476,11 +705,12 @@ mod tests {
         r0.truncate(count + rest);
         assert_eq!(r0.to_hex(), c0.to_hex());
 
-        let mut c = super::Crypter::new(super::Cipher::aes_256_ecb(),
-                                        super::Mode::Decrypt,
-                                        &k0,
-                                        None)
-            .unwrap();
+        let mut c = super::Crypter::new(
+            super::Cipher::aes_256_ecb(),
+            super::Mode::Decrypt,
+            &k0,
+            None,
+        ).unwrap();
         c.pad(false);
         let mut p1 = vec![0; r0.len() + super::Cipher::aes_256_ecb().block_size()];
         let count = c.update(&r0, &mut p1).unwrap();
@@ -491,20 +721,82 @@ mod tests {
 
     #[test]
     fn test_aes_256_cbc_decrypt() {
-        let iv = [4_u8, 223_u8, 153_u8, 219_u8, 28_u8, 142_u8, 234_u8, 68_u8, 227_u8, 69_u8,
-                  98_u8, 107_u8, 208_u8, 14_u8, 236_u8, 60_u8];
-        let data = [143_u8, 210_u8, 75_u8, 63_u8, 214_u8, 179_u8, 155_u8, 241_u8, 242_u8, 31_u8,
-                    154_u8, 56_u8, 198_u8, 145_u8, 192_u8, 64_u8, 2_u8, 245_u8, 167_u8, 220_u8,
-                    55_u8, 119_u8, 233_u8, 136_u8, 139_u8, 27_u8, 71_u8, 242_u8, 119_u8, 175_u8,
-                    65_u8, 207_u8];
-        let ciphered_data = [0x4a_u8, 0x2e_u8, 0xe5_u8, 0x6_u8, 0xbf_u8, 0xcf_u8, 0xf2_u8,
-                             0xd7_u8, 0xea_u8, 0x2d_u8, 0xb1_u8, 0x85_u8, 0x6c_u8, 0x93_u8,
-                             0x65_u8, 0x6f_u8];
-        let mut cr = super::Crypter::new(super::Cipher::aes_256_cbc(),
-                                         super::Mode::Decrypt,
-                                         &data,
-                                         Some(&iv))
-            .unwrap();
+        let iv = [
+            4_u8,
+            223_u8,
+            153_u8,
+            219_u8,
+            28_u8,
+            142_u8,
+            234_u8,
+            68_u8,
+            227_u8,
+            69_u8,
+            98_u8,
+            107_u8,
+            208_u8,
+            14_u8,
+            236_u8,
+            60_u8,
+        ];
+        let data = [
+            143_u8,
+            210_u8,
+            75_u8,
+            63_u8,
+            214_u8,
+            179_u8,
+            155_u8,
+            241_u8,
+            242_u8,
+            31_u8,
+            154_u8,
+            56_u8,
+            198_u8,
+            145_u8,
+            192_u8,
+            64_u8,
+            2_u8,
+            245_u8,
+            167_u8,
+            220_u8,
+            55_u8,
+            119_u8,
+            233_u8,
+            136_u8,
+            139_u8,
+            27_u8,
+            71_u8,
+            242_u8,
+            119_u8,
+            175_u8,
+            65_u8,
+            207_u8,
+        ];
+        let ciphered_data = [
+            0x4a_u8,
+            0x2e_u8,
+            0xe5_u8,
+            0x6_u8,
+            0xbf_u8,
+            0xcf_u8,
+            0xf2_u8,
+            0xd7_u8,
+            0xea_u8,
+            0x2d_u8,
+            0xb1_u8,
+            0x85_u8,
+            0x6c_u8,
+            0x93_u8,
+            0x65_u8,
+            0x6f_u8,
+        ];
+        let mut cr = super::Crypter::new(
+            super::Cipher::aes_256_cbc(),
+            super::Mode::Decrypt,
+            &data,
+            Some(&iv),
+        ).unwrap();
         cr.pad(false);
         let mut unciphered_data = vec![0; data.len() + super::Cipher::aes_256_cbc().block_size()];
         let count = cr.update(&ciphered_data, &mut unciphered_data).unwrap();
@@ -529,9 +821,11 @@ mod tests {
             println!("Computed: {}", computed.to_hex());
             println!("Expected: {}", expected.to_hex());
             if computed.len() != expected.len() {
-                println!("Lengths differ: {} in computed vs {} expected",
-                         computed.len(),
-                         expected.len());
+                println!(
+                    "Lengths differ: {} in computed vs {} expected",
+                    computed.len(),
+                    expected.len()
+                );
             }
             panic!("test failure");
         }
@@ -558,9 +852,11 @@ mod tests {
             println!("Computed: {}", computed.to_hex());
             println!("Expected: {}", expected.to_hex());
             if computed.len() != expected.len() {
-                println!("Lengths differ: {} in computed vs {} expected",
-                         computed.len(),
-                         expected.len());
+                println!(
+                    "Lengths differ: {} in computed vs {} expected",
+                    computed.len(),
+                    expected.len()
+                );
             }
             panic!("test failure");
         }
@@ -742,41 +1038,40 @@ mod tests {
     #[test]
     fn test_aes128_gcm() {
         let key = "0e00c76561d2bd9b40c3c15427e2b08f";
-        let iv =
-            "492cadaccd3ca3fbc9cf9f06eb3325c4e159850b0dbe98199b89b7af528806610b6f63998e1eae80c348e7\
+        let iv = "492cadaccd3ca3fbc9cf9f06eb3325c4e159850b0dbe98199b89b7af528806610b6f63998e1eae80c348e7\
              4cbb921d8326631631fc6a5d304f39166daf7ea15fa1977f101819adb510b50fe9932e12c5a85aa3fd1e73\
              d8d760af218be829903a77c63359d75edd91b4f6ed5465a72662f5055999e059e7654a8edc921aa0d496";
-        let pt =
-            "fef03c2d7fb15bf0d2df18007d99f967c878ad59359034f7bb2c19af120685d78e32f6b8b83b032019956c\
+        let pt = "fef03c2d7fb15bf0d2df18007d99f967c878ad59359034f7bb2c19af120685d78e32f6b8b83b032019956c\
              a9c0195721476b85";
-        let aad =
-            "d8f1163d8c840292a2b2dacf4ac7c36aff8733f18fabb4fa5594544125e03d1e6e5d6d0fd61656c8d8f327\
+        let aad = "d8f1163d8c840292a2b2dacf4ac7c36aff8733f18fabb4fa5594544125e03d1e6e5d6d0fd61656c8d8f327\
              c92839ae5539bb469c9257f109ebff85aad7bd220fdaa95c022dbd0c7bb2d878ad504122c943045d3c5eba\
              8f1f56c0";
-        let ct =
-            "4f6cf471be7cbd2575cd5a1747aea8fe9dea83e51936beac3e68f66206922060c697ffa7af80ad6bb68f2c\
+        let ct = "4f6cf471be7cbd2575cd5a1747aea8fe9dea83e51936beac3e68f66206922060c697ffa7af80ad6bb68f2c\
              f4fc97416ee52abe";
         let tag = "e20b6655";
 
         // this tag is smaller than you'd normally want, but I pulled this test from the part of
         // the NIST test vectors that cover 4 byte tags.
         let mut actual_tag = [0; 4];
-        let out = encrypt_aead(Cipher::aes_128_gcm(),
-                               &Vec::from_hex(key).unwrap(),
-                               Some(&Vec::from_hex(iv).unwrap()),
-                               &Vec::from_hex(aad).unwrap(),
-                               &Vec::from_hex(pt).unwrap(),
-                               &mut actual_tag)
-            .unwrap();
+        let out = encrypt_aead(
+            Cipher::aes_128_gcm(),
+            &Vec::from_hex(key).unwrap(),
+            Some(&Vec::from_hex(iv).unwrap()),
+            &Vec::from_hex(aad).unwrap(),
+            &Vec::from_hex(pt).unwrap(),
+            &mut actual_tag,
+        ).unwrap();
         assert_eq!(ct, out.to_hex());
         assert_eq!(tag, actual_tag.to_hex());
 
-        let out = decrypt_aead(Cipher::aes_128_gcm(),
-                               &Vec::from_hex(key).unwrap(),
-                               Some(&Vec::from_hex(iv).unwrap()),
-                               &Vec::from_hex(aad).unwrap(),
-                               &Vec::from_hex(ct).unwrap(),
-                               &Vec::from_hex(tag).unwrap()).unwrap();
+        let out = decrypt_aead(
+            Cipher::aes_128_gcm(),
+            &Vec::from_hex(key).unwrap(),
+            Some(&Vec::from_hex(iv).unwrap()),
+            &Vec::from_hex(aad).unwrap(),
+            &Vec::from_hex(ct).unwrap(),
+            &Vec::from_hex(tag).unwrap(),
+        ).unwrap();
         assert_eq!(pt, out.to_hex());
     }
 
@@ -808,23 +1103,25 @@ mod tests {
         let tag = "1ae10b594f09e26a7e902ecbd0600691";
 
         let mut actual_tag = [0; 16];
-        let out = encrypt_aead(Cipher::chacha20_poly1305(),
-                               &Vec::from_hex(key).unwrap(),
-                               Some(&Vec::from_hex(iv).unwrap()),
-                               &Vec::from_hex(aad).unwrap(),
-                               &Vec::from_hex(pt).unwrap(),
-                               &mut actual_tag)
-            .unwrap();
+        let out = encrypt_aead(
+            Cipher::chacha20_poly1305(),
+            &Vec::from_hex(key).unwrap(),
+            Some(&Vec::from_hex(iv).unwrap()),
+            &Vec::from_hex(aad).unwrap(),
+            &Vec::from_hex(pt).unwrap(),
+            &mut actual_tag,
+        ).unwrap();
         assert_eq!(ct, out.to_hex());
         assert_eq!(tag, actual_tag.to_hex());
 
-        let out = decrypt_aead(Cipher::chacha20_poly1305(),
-                               &Vec::from_hex(key).unwrap(),
-                               Some(&Vec::from_hex(iv).unwrap()),
-                               &Vec::from_hex(aad).unwrap(),
-                               &Vec::from_hex(ct).unwrap(),
-                               &Vec::from_hex(tag).unwrap())
-            .unwrap();
+        let out = decrypt_aead(
+            Cipher::chacha20_poly1305(),
+            &Vec::from_hex(key).unwrap(),
+            Some(&Vec::from_hex(iv).unwrap()),
+            &Vec::from_hex(aad).unwrap(),
+            &Vec::from_hex(ct).unwrap(),
+            &Vec::from_hex(tag).unwrap(),
+        ).unwrap();
         assert_eq!(pt, out.to_hex());
     }
 }

@@ -29,7 +29,7 @@ pub const NO_PADDING: Padding = Padding(ffi::RSA_NO_PADDING);
 pub const PKCS1_PADDING: Padding = Padding(ffi::RSA_PKCS1_PADDING);
 pub const PKCS1_OAEP_PADDING: Padding = Padding(ffi::RSA_PKCS1_OAEP_PADDING);
 
-foreign_type! {
+foreign_type_and_impl_send_sync! {
     type CType = ffi::RSA;
     fn drop = ffi::RSA_free;
 
@@ -38,11 +38,18 @@ foreign_type! {
 }
 
 impl RsaRef {
+    // FIXME these need to specify output format
     private_key_to_pem!(ffi::PEM_write_bio_RSAPrivateKey);
     public_key_to_pem!(ffi::PEM_write_bio_RSA_PUBKEY);
 
     private_key_to_der!(ffi::i2d_RSAPrivateKey);
     public_key_to_der!(ffi::i2d_RSA_PUBKEY);
+
+    to_der_inner!(
+        /// Serializes the public key to DER-encoded PKCS#1.
+        public_key_to_der_pkcs1,
+        ffi::i2d_RSAPublicKey
+    );
 
     // FIXME should return u32
     pub fn size(&self) -> usize {
@@ -59,21 +66,24 @@ impl RsaRef {
     ///
     /// Panics if `self` has no private components, or if `to` is smaller
     /// than `self.size()`.
-    pub fn private_decrypt(&self,
-                           from: &[u8],
-                           to: &mut [u8],
-                           padding: Padding)
-                           -> Result<usize, ErrorStack> {
+    pub fn private_decrypt(
+        &self,
+        from: &[u8],
+        to: &mut [u8],
+        padding: Padding,
+    ) -> Result<usize, ErrorStack> {
         assert!(self.d().is_some(), "private components missing");
         assert!(from.len() <= i32::max_value() as usize);
         assert!(to.len() >= self.size());
 
         unsafe {
-            let len = try!(cvt_n(ffi::RSA_private_decrypt(from.len() as c_int,
-                                                          from.as_ptr(),
-                                                          to.as_mut_ptr(),
-                                                          self.as_ptr(),
-                                                          padding.0)));
+            let len = cvt_n(ffi::RSA_private_decrypt(
+                from.len() as c_int,
+                from.as_ptr(),
+                to.as_mut_ptr(),
+                self.as_ptr(),
+                padding.0,
+            ))?;
             Ok(len as usize)
         }
     }
@@ -84,21 +94,24 @@ impl RsaRef {
     ///
     /// Panics if `self` has no private components, or if `to` is smaller
     /// than `self.size()`.
-    pub fn private_encrypt(&self,
-                           from: &[u8],
-                           to: &mut [u8],
-                           padding: Padding)
-                           -> Result<usize, ErrorStack> {
+    pub fn private_encrypt(
+        &self,
+        from: &[u8],
+        to: &mut [u8],
+        padding: Padding,
+    ) -> Result<usize, ErrorStack> {
         assert!(self.d().is_some(), "private components missing");
         assert!(from.len() <= i32::max_value() as usize);
         assert!(to.len() >= self.size());
 
         unsafe {
-            let len = try!(cvt_n(ffi::RSA_private_encrypt(from.len() as c_int,
-                                                          from.as_ptr(),
-                                                          to.as_mut_ptr(),
-                                                          self.as_ptr(),
-                                                          padding.0)));
+            let len = cvt_n(ffi::RSA_private_encrypt(
+                from.len() as c_int,
+                from.as_ptr(),
+                to.as_mut_ptr(),
+                self.as_ptr(),
+                padding.0,
+            ))?;
             Ok(len as usize)
         }
     }
@@ -108,43 +121,49 @@ impl RsaRef {
     /// # Panics
     ///
     /// Panics if `to` is smaller than `self.size()`.
-    pub fn public_decrypt(&self,
-                          from: &[u8],
-                          to: &mut [u8],
-                          padding: Padding)
-                          -> Result<usize, ErrorStack> {
+    pub fn public_decrypt(
+        &self,
+        from: &[u8],
+        to: &mut [u8],
+        padding: Padding,
+    ) -> Result<usize, ErrorStack> {
         assert!(from.len() <= i32::max_value() as usize);
         assert!(to.len() >= self.size());
 
         unsafe {
-            let len = try!(cvt_n(ffi::RSA_public_decrypt(from.len() as c_int,
-                                                         from.as_ptr(),
-                                                         to.as_mut_ptr(),
-                                                         self.as_ptr(),
-                                                         padding.0)));
+            let len = cvt_n(ffi::RSA_public_decrypt(
+                from.len() as c_int,
+                from.as_ptr(),
+                to.as_mut_ptr(),
+                self.as_ptr(),
+                padding.0,
+            ))?;
             Ok(len as usize)
         }
     }
 
-    /// Encrypts data using the private key, returning the number of encrypted bytes.
+    /// Encrypts data using the public key, returning the number of encrypted bytes.
     ///
     /// # Panics
     ///
     /// Panics if `to` is smaller than `self.size()`.
-    pub fn public_encrypt(&self,
-                          from: &[u8],
-                          to: &mut [u8],
-                          padding: Padding)
-                          -> Result<usize, ErrorStack> {
+    pub fn public_encrypt(
+        &self,
+        from: &[u8],
+        to: &mut [u8],
+        padding: Padding,
+    ) -> Result<usize, ErrorStack> {
         assert!(from.len() <= i32::max_value() as usize);
         assert!(to.len() >= self.size());
 
         unsafe {
-            let len = try!(cvt_n(ffi::RSA_public_encrypt(from.len() as c_int,
-                                                         from.as_ptr(),
-                                                         to.as_mut_ptr(),
-                                                         self.as_ptr(),
-                                                         padding.0)));
+            let len = cvt_n(ffi::RSA_public_encrypt(
+                from.len() as c_int,
+                from.as_ptr(),
+                to.as_mut_ptr(),
+                self.as_ptr(),
+                padding.0,
+            ))?;
             Ok(len as usize)
         }
     }
@@ -203,6 +222,39 @@ impl RsaRef {
             }
         }
     }
+
+    pub fn dp(&self) -> Option<&BigNumRef> {
+        unsafe {
+            let dp = compat::crt_params(self.as_ptr())[0];
+            if dp.is_null() {
+                None
+            } else {
+                Some(BigNumRef::from_ptr(dp as *mut _))
+            }
+        }
+    }
+
+    pub fn dq(&self) -> Option<&BigNumRef> {
+        unsafe {
+            let dq = compat::crt_params(self.as_ptr())[1];
+            if dq.is_null() {
+                None
+            } else {
+                Some(BigNumRef::from_ptr(dq as *mut _))
+            }
+        }
+    }
+
+    pub fn qi(&self) -> Option<&BigNumRef> {
+        unsafe {
+            let qi = compat::crt_params(self.as_ptr())[2];
+            if qi.is_null() {
+                None
+            } else {
+                Some(BigNumRef::from_ptr(qi as *mut _))
+            }
+        }
+    }
 }
 
 impl Rsa {
@@ -210,33 +262,42 @@ impl Rsa {
     /// the supplied load and save methods for DER formatted keys.
     pub fn from_public_components(n: BigNum, e: BigNum) -> Result<Rsa, ErrorStack> {
         unsafe {
-            let rsa = Rsa(try!(cvt_p(ffi::RSA_new())));
-            try!(cvt(compat::set_key(rsa.0,
-                                     n.as_ptr(),
-                                     e.as_ptr(),
-                                     ptr::null_mut())));
+            let rsa = Rsa(cvt_p(ffi::RSA_new())?);
+            cvt(compat::set_key(
+                rsa.0,
+                n.as_ptr(),
+                e.as_ptr(),
+                ptr::null_mut(),
+            ))?;
             mem::forget((n, e));
             Ok(rsa)
         }
     }
 
-    pub fn from_private_components(n: BigNum,
-                                   e: BigNum,
-                                   d: BigNum,
-                                   p: BigNum,
-                                   q: BigNum,
-                                   dp: BigNum,
-                                   dq: BigNum,
-                                   qi: BigNum)
-                                   -> Result<Rsa, ErrorStack> {
+    pub fn from_private_components(
+        n: BigNum,
+        e: BigNum,
+        d: BigNum,
+        p: BigNum,
+        q: BigNum,
+        dp: BigNum,
+        dq: BigNum,
+        qi: BigNum,
+    ) -> Result<Rsa, ErrorStack> {
         unsafe {
-            let rsa = Rsa(try!(cvt_p(ffi::RSA_new())));
-            try!(cvt(compat::set_key(rsa.0, n.as_ptr(), e.as_ptr(), d.as_ptr())));
+            let rsa = Rsa(cvt_p(ffi::RSA_new())?);
+            cvt(
+                compat::set_key(rsa.0, n.as_ptr(), e.as_ptr(), d.as_ptr()),
+            )?;
             mem::forget((n, e, d));
-            try!(cvt(compat::set_factors(rsa.0, p.as_ptr(), q.as_ptr())));
+            cvt(compat::set_factors(rsa.0, p.as_ptr(), q.as_ptr()))?;
             mem::forget((p, q));
-            try!(cvt(compat::set_crt_params(rsa.0, dp.as_ptr(), dq.as_ptr(),
-                                            qi.as_ptr())));
+            cvt(compat::set_crt_params(
+                rsa.0,
+                dp.as_ptr(),
+                dq.as_ptr(),
+                qi.as_ptr(),
+            ))?;
             mem::forget((dp, dq, qi));
             Ok(rsa)
         }
@@ -248,32 +309,48 @@ impl Rsa {
     pub fn generate(bits: u32) -> Result<Rsa, ErrorStack> {
         ffi::init();
         unsafe {
-            let rsa = Rsa(try!(cvt_p(ffi::RSA_new())));
-            let e = try!(BigNum::from_u32(ffi::RSA_F4 as u32));
-            try!(cvt(ffi::RSA_generate_key_ex(rsa.0, bits as c_int, e.as_ptr(), ptr::null_mut())));
+            let rsa = Rsa(cvt_p(ffi::RSA_new())?);
+            let e = BigNum::from_u32(ffi::RSA_F4 as u32)?;
+            cvt(ffi::RSA_generate_key_ex(
+                rsa.0,
+                bits as c_int,
+                e.as_ptr(),
+                ptr::null_mut(),
+            ))?;
             Ok(rsa)
         }
     }
 
+    // FIXME these need to identify input formats
     private_key_from_pem!(Rsa, ffi::PEM_read_bio_RSAPrivateKey);
     private_key_from_der!(Rsa, ffi::d2i_RSAPrivateKey);
     public_key_from_pem!(Rsa, ffi::PEM_read_bio_RSA_PUBKEY);
     public_key_from_der!(Rsa, ffi::d2i_RSA_PUBKEY);
 
+    from_der_inner!(
+        /// Deserializes a public key from DER-encoded PKCS#1 data.
+        public_key_from_der_pkcs1,
+        Rsa,
+        ffi::d2i_RSAPublicKey
+    );
+
     #[deprecated(since = "0.9.2", note = "use private_key_from_pem_callback")]
     pub fn private_key_from_pem_cb<F>(buf: &[u8], pass_cb: F) -> Result<Rsa, ErrorStack>
-        where F: FnOnce(&mut [c_char]) -> usize
+    where
+        F: FnOnce(&mut [c_char]) -> usize,
     {
         ffi::init();
         let mut cb = CallbackState::new(pass_cb);
-        let mem_bio = try!(MemBioSlice::new(buf));
+        let mem_bio = MemBioSlice::new(buf)?;
 
         unsafe {
             let cb_ptr = &mut cb as *mut _ as *mut c_void;
-            let rsa = try!(cvt_p(ffi::PEM_read_bio_RSAPrivateKey(mem_bio.as_ptr(),
-                                                                 ptr::null_mut(),
-                                                                 Some(invoke_passwd_cb_old::<F>),
-                                                                 cb_ptr)));
+            let rsa = cvt_p(ffi::PEM_read_bio_RSAPrivateKey(
+                mem_bio.as_ptr(),
+                ptr::null_mut(),
+                Some(invoke_passwd_cb_old::<F>),
+                cb_ptr,
+            ))?;
             Ok(Rsa(rsa))
         }
     }
@@ -304,6 +381,12 @@ mod compat {
         [p, q]
     }
 
+    pub unsafe fn crt_params(r: *const RSA) -> [*const BIGNUM; 3] {
+        let (mut dp, mut dq, mut qi) = (ptr::null(), ptr::null(), ptr::null());
+        ffi::RSA_get0_crt_params(r, &mut dp, &mut dq, &mut qi);
+        [dp, dq, qi]
+    }
+
     pub unsafe fn set_key(r: *mut RSA, n: *mut BIGNUM, e: *mut BIGNUM, d: *mut BIGNUM) -> c_int {
         ffi::RSA_set0_key(r, n, e, d)
     }
@@ -312,11 +395,12 @@ mod compat {
         ffi::RSA_set0_factors(r, p, q)
     }
 
-    pub unsafe fn set_crt_params(r: *mut RSA,
-                                 dmp1: *mut BIGNUM,
-                                 dmq1: *mut BIGNUM,
-                                 iqmp: *mut BIGNUM)
-                                 -> c_int {
+    pub unsafe fn set_crt_params(
+        r: *mut RSA,
+        dmp1: *mut BIGNUM,
+        dmq1: *mut BIGNUM,
+        iqmp: *mut BIGNUM,
+    ) -> c_int {
         ffi::RSA_set0_crt_params(r, dmp1, dmq1, iqmp)
     }
 }
@@ -334,6 +418,10 @@ mod compat {
         [(*r).p, (*r).q]
     }
 
+    pub unsafe fn crt_params(r: *const RSA) -> [*const BIGNUM; 3] {
+        [(*r).dmp1, (*r).dmq1, (*r).iqmp]
+    }
+
     pub unsafe fn set_key(r: *mut RSA, n: *mut BIGNUM, e: *mut BIGNUM, d: *mut BIGNUM) -> c_int {
         (*r).n = n;
         (*r).e = e;
@@ -347,11 +435,12 @@ mod compat {
         1 // TODO: is this right? should it be 0? what's success?
     }
 
-    pub unsafe fn set_crt_params(r: *mut RSA,
-                                 dmp1: *mut BIGNUM,
-                                 dmq1: *mut BIGNUM,
-                                 iqmp: *mut BIGNUM)
-                                 -> c_int {
+    pub unsafe fn set_crt_params(
+        r: *mut RSA,
+        dmp1: *mut BIGNUM,
+        dmq1: *mut BIGNUM,
+        iqmp: *mut BIGNUM,
+    ) -> c_int {
         (*r).dmp1 = dmp1;
         (*r).dmq1 = dmq1;
         (*r).iqmp = iqmp;
@@ -376,11 +465,10 @@ mod test {
         let mut password_queried = false;
         let key = include_bytes!("../test/rsa-encrypted.pem");
         Rsa::private_key_from_pem_callback(key, |password| {
-                password_queried = true;
-                password[..6].copy_from_slice(b"mypass");
-                Ok(6)
-            })
-            .unwrap();
+            password_queried = true;
+            password[..6].copy_from_slice(b"mypass");
+            Ok(6)
+        }).unwrap();
 
         assert!(password_queried);
     }
@@ -388,7 +476,8 @@ mod test {
     #[test]
     fn test_to_password() {
         let key = Rsa::generate(2048).unwrap();
-        let pem = key.private_key_to_pem_passphrase(Cipher::aes_128_cbc(), b"foobar").unwrap();
+        let pem = key.private_key_to_pem_passphrase(Cipher::aes_128_cbc(), b"foobar")
+            .unwrap();
         Rsa::private_key_from_pem_passphrase(&pem, b"foobar").unwrap();
         assert!(Rsa::private_key_from_pem_passphrase(&pem, b"fizzbuzz").is_err());
     }
@@ -400,13 +489,17 @@ mod test {
 
         let mut result = vec![0; public_key.size()];
         let original_data = b"This is test";
-        let len = public_key.public_encrypt(original_data, &mut result, PKCS1_PADDING).unwrap();
+        let len = public_key
+            .public_encrypt(original_data, &mut result, PKCS1_PADDING)
+            .unwrap();
         assert_eq!(len, 256);
 
         let pkey = include_bytes!("../test/rsa.pem");
         let private_key = Rsa::private_key_from_pem(pkey).unwrap();
         let mut dec_result = vec![0; private_key.size()];
-        let len = private_key.private_decrypt(&result, &mut dec_result, PKCS1_PADDING).unwrap();
+        let len = private_key
+            .private_decrypt(&result, &mut dec_result, PKCS1_PADDING)
+            .unwrap();
 
         assert_eq!(&dec_result[..len], original_data);
     }
@@ -422,7 +515,8 @@ mod test {
         let mut emesg = vec![0; k0.size()];
         k0.private_encrypt(&msg, &mut emesg, PKCS1_PADDING).unwrap();
         let mut dmesg = vec![0; k1.size()];
-        let len = k1.public_decrypt(&emesg, &mut dmesg, PKCS1_PADDING).unwrap();
+        let len = k1.public_decrypt(&emesg, &mut dmesg, PKCS1_PADDING)
+            .unwrap();
         assert_eq!(msg, &dmesg[..len]);
     }
 
@@ -437,8 +531,8 @@ mod test {
         let mut emesg = vec![0; k0.size()];
         k0.public_encrypt(&msg, &mut emesg, PKCS1_PADDING).unwrap();
         let mut dmesg = vec![0; k1.size()];
-        let len = k1.private_decrypt(&emesg, &mut dmesg, PKCS1_PADDING).unwrap();
+        let len = k1.private_decrypt(&emesg, &mut dmesg, PKCS1_PADDING)
+            .unwrap();
         assert_eq!(msg, &dmesg[..len]);
     }
-
 }

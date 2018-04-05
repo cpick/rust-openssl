@@ -8,6 +8,7 @@ use error::ErrorStack;
 use ssl::MidHandshakeSslStream;
 
 /// An SSL error.
+// FIXME this is missing variants
 #[derive(Debug)]
 pub enum Error {
     /// The SSL session has been closed by the other end
@@ -28,7 +29,7 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        try!(fmt.write_str(self.description()));
+        fmt.write_str(self.description())?;
         if let Some(err) = self.cause() {
             write!(fmt, ": {}", err)
         } else {
@@ -66,6 +67,33 @@ impl From<ErrorStack> for Error {
     }
 }
 
+/// An error indicating that the operation can be immediately retried.
+///
+/// OpenSSL's [`SSL_read`] and [`SSL_write`] functions can return `SSL_ERROR_WANT_READ` even when
+/// the underlying socket is performing blocking IO in certain cases. When this happens, the
+/// the operation can be immediately retried.
+///
+/// To signal this event, the `io::Error` inside of [`Error::WantRead`] will be constructed around
+/// a `RetryError`.
+///
+/// [`SSL_read`]: https://www.openssl.org/docs/manmaster/man3/SSL_read.html
+/// [`SSL_write`]: https://www.openssl.org/docs/manmaster/man3/SSL_write.html
+/// [`Error::WantRead`]: enum.Error.html#variant.WantRead
+#[derive(Debug)]
+pub struct RetryError;
+
+impl fmt::Display for RetryError {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.write_str(error::Error::description(self))
+    }
+}
+
+impl error::Error for RetryError {
+    fn description(&self) -> &str {
+        "operation must be retried"
+    }
+}
+
 /// An error or intermediate state after a TLS handshake attempt.
 #[derive(Debug)]
 pub enum HandshakeError<S> {
@@ -74,6 +102,9 @@ pub enum HandshakeError<S> {
     /// The handshake failed.
     Failure(MidHandshakeSslStream<S>),
     /// The handshake was interrupted midway through.
+    ///
+    /// This error will never be returned for blocking streams.
+    // FIXME change to WouldBlock
     Interrupted(MidHandshakeSslStream<S>),
 }
 
@@ -97,14 +128,14 @@ impl<S: Any + fmt::Debug> StdError for HandshakeError<S> {
 
 impl<S: Any + fmt::Debug> fmt::Display for HandshakeError<S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        try!(f.write_str(StdError::description(self)));
+        f.write_str(StdError::description(self))?;
         match *self {
-            HandshakeError::SetupFailure(ref e) => try!(write!(f, ": {}", e)),
+            HandshakeError::SetupFailure(ref e) => write!(f, ": {}", e)?,
             HandshakeError::Failure(ref s) |
             HandshakeError::Interrupted(ref s) => {
-                try!(write!(f, ": {}", s.error()));
+                write!(f, ": {}", s.error())?;
                 if let Some(err) = s.ssl().verify_result() {
-                    try!(write!(f, ": {}", err));
+                    write!(f, ": {}", err)?;
                 }
             }
         }

@@ -1,4 +1,4 @@
-#![doc(html_root_url="https://docs.rs/openssl/0.9.10")]
+#![doc(html_root_url="https://docs.rs/openssl/0.9")]
 
 #[macro_use]
 extern crate bitflags;
@@ -13,6 +13,8 @@ extern crate openssl_sys as ffi;
 extern crate hex;
 #[cfg(test)]
 extern crate tempdir;
+#[cfg(test)]
+extern crate data_encoding;
 
 #[doc(inline)]
 pub use ffi::init;
@@ -25,10 +27,13 @@ use error::ErrorStack;
 mod macros;
 
 mod bio;
+#[macro_use]
 mod util;
 pub mod aes;
 pub mod asn1;
 pub mod bn;
+#[cfg(not(libressl))]
+pub mod cms;
 pub mod conf;
 pub mod crypto;
 pub mod dh;
@@ -36,6 +41,7 @@ pub mod dsa;
 pub mod ec;
 pub mod ec_key;
 pub mod error;
+pub mod ex_data;
 pub mod hash;
 pub mod memcmp;
 pub mod nid;
@@ -46,6 +52,7 @@ pub mod pkey;
 pub mod rand;
 pub mod rsa;
 pub mod sign;
+pub mod sha;
 pub mod ssl;
 pub mod stack;
 pub mod string;
